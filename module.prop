@@ -1,0 +1,7 @@
+id=TSR_FT
+name=Touch Sampling Rate for Infinix GT 30 Pro
+version=2.0.0
+versionCode=20
+author=Sehannnnn
+description=FocalTech touch sampling rate override for the Infinix GT 30 Pro. Writes chip register 0x88; 0x30 gives 360 Hz. Re-applies after the screen wakes.
+axeronPlugin=14800

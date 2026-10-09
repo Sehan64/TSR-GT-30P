@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Touch sampling rate</title>
+<style>
+:root{--bg:#eef1f4;--ink:#14202b;--mute:#5d6b78;--card:#dde4ea;--accent:#2457ff}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#12171c;--ink:#e7edf2;--mute:#8d9aa6;--card:#222a32;--accent:#7b97ff}
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,sans-serif}
+main{max-width:26rem;margin:0 auto;padding:calc(2rem + env(safe-area-inset-top)) 1.25rem calc(2rem + env(safe-area-inset-bottom))}
+h1{margin:0 0 .25rem;font-size:1.5rem;font-weight:650;letter-spacing:-.01em}
+#now{margin:0 0 1.5rem;color:var(--mute)}
+.rates{display:grid;gap:.5rem}
+.rate{appearance:none;border:1px solid transparent;border-radius:10px;background:var(--card);color:inherit;
+  font:inherit;font-size:1.125rem;padding:.9rem 1rem;text-align:left;width:100%;cursor:pointer;
+  -webkit-tap-highlight-color:transparent}
+.rate:disabled{opacity:.5;cursor:default}
+.rate small{color:var(--mute);font-size:.875rem}
+.rate[aria-pressed=true]{border-color:var(--accent);font-weight:650}
+.rate[aria-pressed=true] small{color:var(--accent)}
+.rate:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#custom{display:flex;gap:.5rem;margin:1rem 0 0}
+#custom input{flex:1;min-width:0;appearance:none;border:1px solid var(--card);border-radius:10px;
+  background:var(--card);color:inherit;font:inherit;font-size:1.125rem;padding:.9rem 1rem}
+#custom input::placeholder{color:var(--mute)}
+#custom input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#custom input:disabled{opacity:.5}
+#custom button{appearance:none;border:0;border-radius:10px;background:var(--accent);color:#fff;
+  font:inherit;font-weight:650;padding:.9rem 1.25rem;cursor:pointer;-webkit-tap-highlight-color:transparent}
+#custom button:disabled{opacity:.5;cursor:default}
+#status{min-height:1.45em;margin:1.5rem 0 0}
+.hint{margin:.5rem 0 0;color:var(--mute);font-size:.875rem}
+.hint.warn{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Touch sampling rate</h1>
+  <p id="now">Reading…</p>
+  <div class="rates" id="rates" role="group" aria-label="Sampling rate"></div>
+  <form id="custom" novalidate>
+    <input id="hz" type="number" inputmode="numeric" min="10" max="2550" step="10"
+           placeholder="Custom Hz" aria-label="Custom sampling rate in Hz">
+    <button type="submit" id="set">Set</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <p class="hint" id="detail" style="word-break:break-all"></p>
+  <p class="hint">Reverts when the screen suspends - re-apply after waking.</p>
+</main>
+<script>
+// Register 0x88 is a firmware rate-table lookup, not a linear value.
+// These are the distinct rates measured on this device - each one hits a
+// different table entry. Duplicates are omitted; use the box for anything else.
+// Ordered by measured actual rate, not by register value - the table is
+// non-monotonic, so 0x11 > 0x12 > 0x13 in real output.
+const RATES = [0x10, 0x12, 0x11, 0x18, 0x14, 0x1E, 0x1A, 0x24, 0x30];
+
+// Measured delivered Hz per register value. The register's nominal value is
+// not the delivered rate: 0x30 requests 480 and delivers 360. Anything absent
+// falls back to nominal.
+const MEASURED = {
+  0x10: 160, 0x12: 180, 0x11: 200, 0x13: 200, 0x18: 240,
+  0x14: 250, 0x15: 250, 0x16: 250, 0x17: 250,
+  0x1E: 290, 0x19: 310, 0x1A: 310, 0x1B: 310, 0x1C: 310, 0x1D: 310,
+  0x24: 333, 0x30: 360
+};
+const GLOB = '/sys/class/input/input*/device/fts_rw_reg';
+
+const $ = id => document.getElementById(id);
+const list = $('rates'), now = $('now'), status = $('status'), detail = $('detail');
+const form = $('custom'), hzIn = $('hz'), setBtn = $('set');
+let busy = false, calls = 0, reg = 0;
+
+function sh(cmd) {
+  return new Promise((resolve, reject) => {
+    if (!window.ksu) return reject(new Error('no-ksu'));
+    const cb = 'cb_' + Date.now() + '_' + calls++;
+    window[cb] = (code, out) => { delete window[cb]; resolve({ code, out: (out || '').trim() }); };
+    ksu.exec(cmd, '{}', cb);
+  });
+}
+
+const hex = v => v.toString(16).toUpperCase().padStart(2, '0');
+
+async function locate() {
+  if (reg) return reg;
+  const r = await sh('find ' + GLOB);
+  const p = r.out.split('\n')[0];
+  if (r.code !== 0 || !/^\/sys\/[\w\/.:-]+$/.test(p)) throw { step: 'find', r };
+  return (reg = p);
+}
+
+async function readRate() {
+  const p = await locate();
+  await sh('echo 88 > ' + p);
+  const r = await sh('cat ' + p);
+  const line = r.out.split('\n').filter(Boolean).pop() || '';
+  const m = line.match(/:\s*([0-9A-Fa-f]{2})/);
+  if (r.code !== 0 || !m) throw { step: 'read', r };
+  return parseInt(m[1], 16);
+}
+
+async function writeRate(v) {
+  const p = await locate();
+  const w = await sh('echo 88' + hex(v) + ' > ' + p);
+  if (w.code !== 0) throw { step: 'write', r: w };
+  return readRate();
+}
+
+RATES.forEach(v => {
+  const b = document.createElement('button');
+  b.className = 'rate';
+  b.dataset.v = v;
+  b.setAttribute('aria-pressed', 'false');
+  b.innerHTML = (MEASURED[v] || v * 10) + ' <small>Hz</small>';
+  b.onclick = () => apply(v);
+  list.append(b);
+});
+
+function lock(on) {
+  list.querySelectorAll('button').forEach(b => b.disabled = on);
+  hzIn.disabled = on;
+  setBtn.disabled = on;
+}
+
+function paint(cur) {
+  now.textContent = 'Currently ' + (MEASURED[cur] || cur * 10) + ' Hz';
+  list.querySelectorAll('button').forEach(b =>
+    b.setAttribute('aria-pressed', String(+b.dataset.v === cur)));
+  if (!RATES.includes(cur)) hzIn.value = cur * 10;
+}
+
+function fail(err) {
+  lock(true);
+  now.textContent = 'Unavailable';
+  if (err && err.message === 'no-ksu') {
+    status.textContent = 'Open this page from KernelSU Manager.';
+    detail.textContent = '';
+    return;
+  }
+  status.textContent = err && err.step === 'find'
+    ? 'No FocalTech touch device found.'
+    : 'Could not read the touch controller.';
+  const r = err && err.r;
+  detail.textContent = r
+    ? err.step + ': exit ' + r.code + (r.out ? ', ' + r.out : ', no output')
+    : String((err && err.message) || err);
+}
+
+async function refresh() {
+  if (busy) return;
+  try {
+    paint(await readRate());
+    status.textContent = ''; detail.textContent = '';
+    lock(false);
+  } catch (e) { fail(e); }
+}
+
+async function apply(v) {
+  if (busy) return;
+  busy = true; lock(true);
+  status.textContent = 'Applying…';
+  try {
+    const cur = await writeRate(v);
+    paint(cur);
+    status.textContent = cur === v
+      ? 'Set to ' + (MEASURED[v] || v * 10) + ' Hz'
+      : 'The driver kept ' + (MEASURED[cur] || cur * 10) + ' Hz.';
+    lock(false);
+  } catch (e) { fail(e); }
+  finally { busy = false; }
+}
+
+form.addEventListener('submit', e => {
+  e.preventDefault();
+  if (busy) return;
+  const raw = hzIn.value.trim();
+  const n = Number(raw);
+  if (raw === '' || !Number.isFinite(n)) {
+    status.textContent = 'Enter a rate in Hz.';
+    return;
+  }
+  if (n < 10 || n > 2550) {
+    status.textContent = 'Must be between 10 and 2550 Hz.';
+    return;
+  }
+  if (n % 10) {
+    status.textContent = 'Must be a multiple of 10 Hz.';
+    return;
+  }
+  apply(n / 10);
+});
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+refresh();
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+# Build artifacts
+*.zip
+*.apk
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
